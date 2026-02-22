@@ -120,11 +120,14 @@ func NewServer(nc *nats.Conn) *Server {
 			s.entityStateMu.Unlock()
 		}
 
-		out, _ := json.Marshal(map[string]any{
-			"type":         "state",
-			"id":           deviceID,
-			"entity_state": map[string]any{entityID: payload},
-		})
+		// Spread the bus message into the WebSocket message and add the "type" property.
+		var busMsg map[string]any
+		if err := json.Unmarshal(msg.Data, &busMsg); err != nil {
+			return
+		}
+		busMsg["type"] = "state"
+
+		out, _ := json.Marshal(busMsg)
 		log.Printf("[state] entity=%s device=%s → %d client(s)", entityID, deviceID, s.hub.clientCount())
 		s.hub.broadcast(out)
 	})
