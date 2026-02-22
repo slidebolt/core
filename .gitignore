@@ -1,0 +1,13 @@
+# Binaries and executable tests
+bin/
+core
+*.test
+*.exe
+
+# Go workspace and vendor
+vendor/
+go.work
+go.work.sum
+
+# Operating system files
+.DS_Store
