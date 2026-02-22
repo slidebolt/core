@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"plugin-sdk"
+	"github.com/slidebolt/plugin-sdk"
 	"sync"
 	"time"
 

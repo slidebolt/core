@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	sdk "plugin-sdk"
+	sdk "github.com/slidebolt/plugin-sdk"
 	"strings"
 	"sync"
 	"time"

@@ -1,13 +1,13 @@
-# Binaries and executable tests
+# Binaries
 bin/
 core
-*.test
-*.exe
 
-# Go workspace and vendor
-vendor/
+# Local Development
 go.work
 go.work.sum
 
-# Operating system files
+# Docker Staging (Pre-GitHub)
+.stage/
+
+# OS Junk
 .DS_Store
