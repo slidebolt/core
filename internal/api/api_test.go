@@ -15,6 +15,16 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
+func postJSON(t *testing.T, url string, body any) *http.Response {
+	t.Helper()
+	raw, _ := json.Marshal(body)
+	res, err := http.Post(url, "application/json", bytes.NewReader(raw))
+	if err != nil {
+		t.Fatalf("post %s: %v", url, err)
+	}
+	return res
+}
+
 func startTestNATS(t *testing.T) (*natsserver.Server, *nats.Conn) {
 	t.Helper()
 
@@ -235,5 +245,179 @@ func TestExtractStatePayload(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestMCPCall_SendCommand_EntityUUID_PublishesEntitySubjectAndFlattensPayload(t *testing.T) {
+	ns, nc := startTestNATS(t)
+	defer ns.Shutdown()
+	defer nc.Close()
+
+	mux := http.NewServeMux()
+	s := NewServer(nc)
+	s.regMu.Lock()
+	s.entityToDevice["ent-1"] = "dev-1"
+	s.regMu.Unlock()
+	s.RegisterRoutes(mux)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	sub, err := nc.SubscribeSync("entity.ent-1.command")
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	nc.Flush()
+
+	req := map[string]any{
+		"bundle_id": "core",
+		"tool":      "send_command",
+		"args": map[string]any{
+			"uuid":      "ent-1",
+			"command":   "SetBrightness",
+			"payload":   map[string]any{"level": 11},
+			"entity_id": "ent-1",
+		},
+	}
+	res := postJSON(t, ts.URL+"/api/mcp/call", req)
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected status: got=%d want=%d", res.StatusCode, http.StatusOK)
+	}
+
+	msg, err := sub.NextMsg(2 * time.Second)
+	if err != nil {
+		t.Fatalf("expected command message: %v", err)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(msg.Data, &got); err != nil {
+		t.Fatalf("invalid nats payload: %v", err)
+	}
+	if got["subject"] != "entity.ent-1.command" {
+		t.Fatalf("unexpected subject: %v", got["subject"])
+	}
+	payload, _ := got["payload"].(map[string]any)
+	if payload["command"] != "SetBrightness" {
+		t.Fatalf("unexpected command: %v", payload["command"])
+	}
+	if fmt.Sprintf("%.0f", payload["level"]) != "11" {
+		t.Fatalf("expected flattened level=11, got payload=%v", payload)
+	}
+	if _, nested := payload["payload"]; nested {
+		t.Fatalf("payload should be flattened, got nested payload field: %v", payload["payload"])
+	}
+}
+
+func TestMCPCall_SendCommand_DeviceUUID_PublishesDeviceSubject(t *testing.T) {
+	ns, nc := startTestNATS(t)
+	defer ns.Shutdown()
+	defer nc.Close()
+
+	mux := http.NewServeMux()
+	s := NewServer(nc)
+	s.regMu.Lock()
+	s.registry["dev-1"] = json.RawMessage(`{"uuid":"dev-1"}`)
+	s.regMu.Unlock()
+	s.RegisterRoutes(mux)
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	sub, err := nc.SubscribeSync("device.dev-1.command")
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	nc.Flush()
+
+	req := map[string]any{
+		"bundle_id": "core",
+		"tool":      "send_command",
+		"args": map[string]any{
+			"uuid":    "dev-1",
+			"command": "TurnOn",
+		},
+	}
+	res := postJSON(t, ts.URL+"/api/mcp/call", req)
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected status: got=%d want=%d", res.StatusCode, http.StatusOK)
+	}
+
+	msg, err := sub.NextMsg(2 * time.Second)
+	if err != nil {
+		t.Fatalf("expected command message: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(msg.Data, &got); err != nil {
+		t.Fatalf("invalid nats payload: %v", err)
+	}
+	if got["subject"] != "device.dev-1.command" {
+		t.Fatalf("unexpected subject: %v", got["subject"])
+	}
+}
+
+func TestHandlePluginHealth_AggregatesBundleHealthRPC(t *testing.T) {
+	ns, nc := startTestNATS(t)
+	defer ns.Shutdown()
+	defer nc.Close()
+
+	_, err := nc.Subscribe("bundle.discovery", func(msg *nats.Msg) {
+		_ = nc.Publish(msg.Reply, []byte(`{"id":"plugin-automation","name":"Automation","status":"active"}`))
+		_ = nc.Publish(msg.Reply, []byte(`{"id":"plugin-wiz","name":"Wiz","status":"active"}`))
+	})
+	if err != nil {
+		t.Fatalf("subscribe bundle.discovery: %v", err)
+	}
+	_, err = nc.Subscribe("bundle.plugin-automation.health", func(msg *nats.Msg) {
+		_ = nc.Publish(msg.Reply, []byte(`{"bundle_id":"plugin-automation","status":"ok","framework":{"nats_connected":true}}`))
+	})
+	if err != nil {
+		t.Fatalf("subscribe bundle.plugin-automation.health: %v", err)
+	}
+	nc.Flush()
+
+	ts := startTestAPI(t, nc)
+	defer ts.Close()
+
+	res, err := http.Get(ts.URL + "/api/health/plugins")
+	if err != nil {
+		t.Fatalf("get health plugins: %v", err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected status: got=%d want=%d", res.StatusCode, http.StatusOK)
+	}
+
+	var got []map[string]any
+	if err := json.NewDecoder(res.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 bundle health rows, got %d", len(got))
+	}
+
+	var foundAutomation, foundWiz bool
+	for _, row := range got {
+		switch row["bundle_id"] {
+		case "plugin-automation":
+			foundAutomation = true
+			if row["error"] != nil && row["error"] != "" {
+				t.Fatalf("unexpected automation error: %v", row["error"])
+			}
+			health, _ := row["health"].(map[string]any)
+			if health["status"] != "ok" {
+				t.Fatalf("unexpected automation health: %v", health)
+			}
+		case "plugin-wiz":
+			foundWiz = true
+			if row["health"] != nil {
+				t.Fatalf("expected wiz health to be absent, got %v", row["health"])
+			}
+			if row["error"] == nil || row["error"] == "" {
+				t.Fatalf("expected wiz error for missing health responder")
+			}
+		}
+	}
+	if !foundAutomation || !foundWiz {
+		t.Fatalf("missing expected bundle rows: automation=%v wiz=%v", foundAutomation, foundWiz)
 	}
 }

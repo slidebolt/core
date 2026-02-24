@@ -3,9 +3,9 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	sdk "github.com/slidebolt/plugin-sdk"
 	"log"
 	"net/http"
-	sdk "github.com/slidebolt/plugin-sdk"
 	"strings"
 	"sync"
 	"time"
@@ -65,6 +65,8 @@ type Server struct {
 	nc  *nats.Conn
 	hub *hub
 
+	rebuildReqCh chan struct{}
+
 	regMu          sync.RWMutex
 	entityToDevice map[string]string          // entity UUID → device UUID
 	registry       map[string]json.RawMessage // device UUID → raw JSON (persistent cache)
@@ -77,10 +79,12 @@ func NewServer(nc *nats.Conn) *Server {
 	s := &Server{
 		nc:              nc,
 		hub:             newHub(),
+		rebuildReqCh:    make(chan struct{}, 1),
 		entityToDevice:  make(map[string]string),
 		registry:        make(map[string]json.RawMessage),
 		entityLiveState: make(map[string]map[string]any),
 	}
+	go s.rebuildLoop()
 
 	// Subscribe to entity state updates; cache and fan-out to connected WS clients.
 	nc.Subscribe("entity.*.state", func(msg *nats.Msg) {
@@ -97,51 +101,160 @@ func NewServer(nc *nats.Conn) *Server {
 
 		if !ok {
 			log.Printf("[state] unknown entity %s — rebuilding map", entityID)
-			go s.rebuildAndDiff()
+			s.requestRebuild()
 			return
 		}
 
 		payload := extractStatePayload(msg.Data)
 
+		var payloadMap map[string]any
+		if m, ok := payload.(map[string]any); ok {
+			payloadMap = m
+		}
+
 		// Cache the live state so new WS clients get it in their snapshot.
-		if payloadMap, ok := payload.(map[string]any); ok {
+		if payloadMap != nil {
 			s.entityStateMu.Lock()
 			if existing, ok := s.entityLiveState[entityID]; ok {
 				for k, v := range payloadMap {
 					existing[k] = v
 				}
 			} else {
-				clone := make(map[string]any, len(payloadMap))
-				for k, v := range payloadMap {
-					clone[k] = v
-				}
+				clone := cloneMap(payloadMap)
 				s.entityLiveState[entityID] = clone
 			}
 			s.entityStateMu.Unlock()
 		}
 
-		// Spread the bus message into the WebSocket message and add the "type" property.
+		if s.hub.clientCount() == 0 {
+			return
+		}
+
+		// Spread the bus message into the WebSocket message and add the "type" property plus a normalized payload map.
 		var busMsg map[string]any
 		if err := json.Unmarshal(msg.Data, &busMsg); err != nil {
 			return
 		}
-		busMsg["type"] = "state"
+		entityStates := map[string]map[string]any{}
+		if payloadMap != nil {
+			entityStates[entityID] = cloneMap(payloadMap)
+		} else {
+			entityStates[entityID] = map[string]any{"value": payload}
+		}
 
-		out, _ := json.Marshal(busMsg)
-		log.Printf("[state] entity=%s device=%s → %d client(s)", entityID, deviceID, s.hub.clientCount())
+		event := make(map[string]any, len(busMsg)+3)
+		for k, v := range busMsg {
+			event[k] = v
+		}
+		event["type"] = "state"
+		event["id"] = deviceID
+		event["entity_state"] = entityStates
+
+		out, _ := json.Marshal(event)
 		s.hub.broadcast(out)
 	})
 
 	// Subscribe to device registration events.
 	nc.Subscribe("registry.device.register", func(msg *nats.Msg) {
 		log.Printf("[registry] register event received")
-		go s.rebuildAndDiff()
+		s.requestRebuild()
 	})
 
 	// Subscribe to device unregistration events.
 	nc.Subscribe("registry.device.unregister", func(msg *nats.Msg) {
 		log.Printf("[registry] unregister event received")
-		go s.rebuildAndDiff()
+		s.requestRebuild()
+	})
+
+	// Add global label search responder
+	nc.Subscribe("registry.search_by_label", func(msg *nats.Msg) {
+		var searchLabels []string
+		data := msg.Data
+		if len(data) > 0 && data[0] == '[' {
+			// Try JSON array first
+			_ = json.Unmarshal(data, &searchLabels)
+		}
+		if len(searchLabels) == 0 && len(data) > 0 {
+			// Fallback to raw string
+			searchLabels = []string{string(data)}
+		}
+
+		if len(searchLabels) == 0 {
+			return
+		}
+
+		s.regMu.RLock()
+		registry := s.registry
+		s.regMu.RUnlock()
+
+		matchesAll := func(target []string) bool {
+			for _, s := range searchLabels {
+				found := false
+				for _, t := range target {
+					if t == s {
+						found = true
+						break
+					}
+				}
+				if !found {
+					return false
+				}
+			}
+			return true
+		}
+
+		var matches []string
+		for uuid, raw := range registry {
+			var dev struct {
+				Metadata struct {
+					Labels []string `json:"labels"`
+				} `json:"metadata"`
+				Entities map[string]struct {
+					Metadata struct {
+						Labels []string `json:"labels"`
+					} `json:"metadata"`
+				} `json:"entities"`
+			}
+			if err := json.Unmarshal(raw, &dev); err == nil {
+				// Check device
+				if matchesAll(dev.Metadata.Labels) {
+					matches = append(matches, uuid)
+				}
+				// Check entities
+				for eid, ent := range dev.Entities {
+					if matchesAll(ent.Metadata.Labels) {
+						matches = append(matches, eid)
+					}
+				}
+			}
+		}
+		resp, _ := json.Marshal(matches)
+		s.nc.Publish(msg.Reply, resp)
+	})
+
+	// Add global object fetcher (returns metadata + state snapshot)
+	nc.Subscribe("registry.get_object", func(msg *nats.Msg) {
+		uuid := string(msg.Data)
+		if uuid == "" {
+			return
+		}
+
+		s.regMu.RLock()
+		raw, ok := s.registry[uuid]
+		if !ok {
+			// Try entity lookup
+			if devUUID, ok := s.entityToDevice[uuid]; ok {
+				raw = s.registry[devUUID]
+			}
+		}
+		s.regMu.RUnlock()
+
+		if raw == nil {
+			s.nc.Publish(msg.Reply, []byte("{}"))
+			return
+		}
+
+		s.nc.Publish(msg.Reply, raw)
 	})
 
 	return s
@@ -166,14 +279,46 @@ func extractStatePayload(raw []byte) any {
 	return obj
 }
 
+func cloneMap(src map[string]any) map[string]any {
+	dst := make(map[string]any, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
+}
+
+func (s *Server) requestRebuild() {
+	select {
+	case s.rebuildReqCh <- struct{}{}:
+	default:
+		// Rebuild already queued/in-flight; coalesce duplicate requests.
+	}
+}
+
+func (s *Server) rebuildLoop() {
+	for range s.rebuildReqCh {
+		for {
+			s.rebuildAndDiff()
+			select {
+			case <-s.rebuildReqCh:
+				// Another request arrived while rebuilding; run one more pass.
+				continue
+			default:
+			}
+			break
+		}
+	}
+}
+
 func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/ws", s.handleWS)
 	mux.HandleFunc("/api/bundles", s.handleBundles)
 	mux.HandleFunc("/api/registry", s.handleRegistry)
+	mux.HandleFunc("/api/health/plugins", s.handlePluginHealth)
 	mux.HandleFunc("/api/publish", s.handlePublish)
 	mux.HandleFunc("/api/mcp/catalog", s.handleMCPCatalog)
 	mux.HandleFunc("/api/mcp/call", s.handleMCPCall)
-	log.Printf("[api] routes registered: /api/ws /api/bundles /api/registry /api/publish /api/mcp/catalog /api/mcp/call")
+	log.Printf("[api] routes registered: /api/ws /api/bundles /api/registry /api/health/plugins /api/publish /api/mcp/catalog /api/mcp/call")
 }
 
 // discoverBundles scatter-gathers bundle.discovery and returns raw JSON for each bundle.
@@ -231,7 +376,7 @@ func (s *Server) fetchAllDevices() map[string]json.RawMessage {
 			msg, err := s.nc.Request(
 				fmt.Sprintf("bundle.%s.get_devices", bundleID),
 				nil,
-				500*time.Millisecond,
+				2*time.Second,
 			)
 			if err != nil {
 				log.Printf("[registry] bundle=%s get_devices failed: %v", bundleID, err)
@@ -355,6 +500,54 @@ func (s *Server) handleRegistry(w http.ResponseWriter, r *http.Request) {
 	registry := s.fetchAllDevices()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(registry)
+}
+
+// handlePluginHealth serves GET /api/health/plugins by aggregating bundle health RPCs.
+func (s *Server) handlePluginHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	type bundleDiscovery struct {
+		ID     string `json:"id"`
+		Name   string `json:"name"`
+		Status string `json:"status"`
+	}
+	type pluginHealthResp struct {
+		BundleID string `json:"bundle_id"`
+		Name     string `json:"name,omitempty"`
+		Status   string `json:"status"`
+		Error    string `json:"error,omitempty"`
+		Health   any    `json:"health,omitempty"`
+	}
+
+	bundlesRaw := s.discoverBundles()
+	out := make([]pluginHealthResp, 0, len(bundlesRaw))
+	for _, raw := range bundlesRaw {
+		var b bundleDiscovery
+		if err := json.Unmarshal(raw, &b); err != nil || b.ID == "" {
+			continue
+		}
+		item := pluginHealthResp{BundleID: b.ID, Name: b.Name, Status: b.Status}
+		resp, err := s.nc.Request(fmt.Sprintf("bundle.%s.health", b.ID), nil, 750*time.Millisecond)
+		if err != nil || resp == nil || len(resp.Data) == 0 {
+			item.Error = fmt.Sprintf("health unavailable: %v", err)
+			out = append(out, item)
+			continue
+		}
+		var health any
+		if err := json.Unmarshal(resp.Data, &health); err != nil {
+			item.Error = fmt.Sprintf("invalid health json: %v", err)
+			out = append(out, item)
+			continue
+		}
+		item.Health = health
+		out = append(out, item)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(out)
 }
 
 // handlePublish serves POST /api/publish — publishes a raw event onto the NATS bus.
@@ -489,14 +682,33 @@ func (s *Server) handleMCPCatalog(w http.ResponseWriter, r *http.Request) {
 			"bundle_id": "core",
 			"mcp": map[string]any{
 				"tools": []map[string]any{
-					{"name": "list_devices", "description": "List all discovered devices in the registry"},
-					{"name": "send_command", "description": "Send a command to a device by UUID"},
-					{"name": "delete_device", "description": "Delete a device by UUID (purges entities/state)"},
-					{"name": "set_entity_script", "description": "Set script for an entity UUID and hot-reload it"},
-					{"name": "update_device_raw", "description": "Update raw data for a device by UUID"},
-					{"name": "create_entity", "description": "Create a new entity on an existing device"},
-					{"name": "configure_plugin", "description": "Update persistent config for a plugin bundle"},
-					{"name": "publish", "description": "Publish a raw payload to a bus topic"},
+					{"name": "list_devices", "description": "Read all IoT devices"},
+					{"name": "get_device", "description": "Read a single device by UUID"},
+					{"name": "delete_device", "description": "Delete a device by UUID"},
+					{"name": "update_device_raw", "description": "Update raw data for a device"},
+
+					{"name": "create_entity", "description": "Create a new entity on a device"},
+					{"name": "get_entity", "description": "Read an entity by UUID"},
+					{"name": "update_entity_raw", "description": "Update raw data for an entity"},
+					{"name": "delete_entity", "description": "Delete an entity by UUID"},
+
+					{"name": "get_entity_script", "description": "Read script for an entity"},
+					{"name": "set_entity_script", "description": "Update script for an entity"},
+					{"name": "get_bundle_script", "description": "Read script for a bundle (plugin)"},
+					{"name": "set_bundle_script", "description": "Update script for a bundle (plugin)"},
+
+					{"name": "get_plugin_config", "description": "Read config/raw data for a plugin"},
+					{"name": "update_plugin_config", "description": "Update config for a plugin bundle"},
+					{"name": "reload_bundle", "description": "Reload a plugin bundle, re-initializing devices while preserving UUIDs"},
+					{"name": "update_metadata", "description": "Update name and other metadata for an object"},
+					{"name": "update_local_name", "description": "Update the user-friendly local name for an object"},
+					{"name": "update_source_name", "description": "Update the discovery-based source name for an object"},
+					{"name": "send_command", "description": "Execute a command on a device/entity"},
+
+					{"name": "add_label", "description": "Add a label to a device or entity"},
+					{"name": "remove_label", "description": "Remove a label from a device or entity"},
+					{"name": "set_labels", "description": "Set all labels for a device or entity"},
+					{"name": "search_by_label", "description": "Search for devices and entities by label"},
 				},
 			},
 		},
@@ -534,10 +746,186 @@ func (s *Server) handleMCPCall(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(v)
 	}
 
+	resolveBundle := func(uuid string) string {
+		registry := s.fetchAllDevices()
+		devRaw, ok := registry[uuid]
+		if ok {
+			var dev struct {
+				Bundle string `json:"bundle"`
+			}
+			if err := json.Unmarshal(devRaw, &dev); err == nil {
+				return dev.Bundle
+			}
+		}
+		// Try entity lookup
+		for _, raw := range registry {
+			var dev struct {
+				Bundle   string                     `json:"bundle"`
+				Entities map[string]json.RawMessage `json:"entities"`
+			}
+			if err := json.Unmarshal(raw, &dev); err == nil {
+				if _, ok := dev.Entities[uuid]; ok {
+					return dev.Bundle
+				}
+			}
+		}
+		return ""
+	}
+
 	switch req.Tool {
 	case "list_devices":
 		registry := s.fetchAllDevices()
 		writeJSON(registry)
+		return
+	case "get_device":
+		uuid, _ := req.Args["uuid"].(string)
+		registry := s.fetchAllDevices()
+		writeJSON(registry[uuid])
+		return
+	case "get_entity":
+		uuid, _ := req.Args["uuid"].(string)
+		bundleID := resolveBundle(uuid)
+		payload, _ := json.Marshal(map[string]any{"uuid": uuid})
+		resp, _ := s.nc.Request(fmt.Sprintf("bundle.%s.get_entity", bundleID), payload, 2*time.Second)
+		writeJSON(json.RawMessage(resp.Data))
+		return
+	case "update_entity_raw":
+		uuid, _ := req.Args["uuid"].(string)
+		raw, _ := req.Args["raw"].(map[string]interface{})
+		bundleID := resolveBundle(uuid)
+		payload, _ := json.Marshal(map[string]any{"entity_uuid": uuid, "raw": raw})
+		s.nc.Publish(fmt.Sprintf("bundle.%s.update_entity_raw", bundleID), payload)
+		writeJSON(map[string]any{"ok": true})
+		return
+	case "delete_entity":
+		uuid, _ := req.Args["uuid"].(string)
+		bundleID := resolveBundle(uuid)
+		payload, _ := json.Marshal(map[string]any{"uuid": uuid})
+		s.nc.Request(fmt.Sprintf("bundle.%s.delete_entity", bundleID), payload, 2*time.Second)
+		writeJSON(map[string]any{"ok": true})
+		return
+	case "get_entity_script":
+		uuid, _ := req.Args["uuid"].(string)
+		bundleID := resolveBundle(uuid)
+		resp, err := s.nc.Request(fmt.Sprintf("bundle.%s.get_entity_script", bundleID), []byte(uuid), 2*time.Second)
+		if err != nil || resp == nil {
+			http.Error(w, fmt.Sprintf("get_entity_script request failed: %v", err), http.StatusBadGateway)
+			return
+		}
+		writeJSON(map[string]any{"script": string(resp.Data)})
+		return
+	case "get_bundle_script":
+		bundleID, _ := req.Args["bundle_id"].(string)
+		resp, _ := s.nc.Request(fmt.Sprintf("bundle.%s.get_script", bundleID), nil, 2*time.Second)
+		writeJSON(map[string]any{"script": string(resp.Data)})
+		return
+	case "set_bundle_script":
+		bundleID, _ := req.Args["bundle_id"].(string)
+		script, _ := req.Args["script"].(string)
+		s.nc.Request(fmt.Sprintf("bundle.%s.set_script", bundleID), []byte(script), 2*time.Second)
+		writeJSON(map[string]any{"ok": true})
+		return
+	case "get_plugin_config":
+		bundleID, _ := req.Args["bundle_id"].(string)
+		resp, _ := s.nc.Request(fmt.Sprintf("bundle.%s.get_raw", bundleID), nil, 2*time.Second)
+		writeJSON(json.RawMessage(resp.Data))
+		return
+	case "update_plugin_config":
+		bundleID, _ := req.Args["bundle_id"].(string)
+		config, _ := req.Args["config"].(map[string]interface{})
+		payload, _ := json.Marshal(config)
+		s.nc.Publish(fmt.Sprintf("bundle.%s.configure", bundleID), payload)
+		writeJSON(map[string]any{"ok": true})
+		return
+	case "update_metadata":
+		uuid, _ := req.Args["uuid"].(string)
+		name, _ := req.Args["name"].(string)
+		if uuid == "" {
+			http.Error(w, "uuid is required", http.StatusBadRequest)
+			return
+		}
+		bundleID := resolveBundle(uuid)
+		if bundleID == "" {
+			http.Error(w, "unable to resolve bundle for object", http.StatusNotFound)
+			return
+		}
+
+		payload := map[string]any{"uuid": uuid}
+		if name != "" {
+			payload["name"] = name
+		}
+
+		// Try device update first, then entity update
+		prefix := "device"
+		s.regMu.RLock()
+		_, isDevice := s.registry[uuid]
+		if !isDevice {
+			if _, isEntity := s.entityToDevice[uuid]; isEntity {
+				prefix = "entity"
+			}
+		}
+		s.regMu.RUnlock()
+
+		subject := fmt.Sprintf("bundle.%s.update_%s_metadata", bundleID, prefix)
+		data, _ := json.Marshal(payload)
+		s.nc.Publish(subject, data)
+		writeJSON(map[string]any{"ok": true, "subject": subject})
+		return
+	case "update_local_name":
+		uuid, _ := req.Args["uuid"].(string)
+		name, _ := req.Args["name"].(string)
+		if uuid == "" || name == "" {
+			http.Error(w, "uuid and name are required", http.StatusBadRequest)
+			return
+		}
+		bundleID := resolveBundle(uuid)
+		if bundleID == "" {
+			http.Error(w, "unable to resolve bundle for object", http.StatusNotFound)
+			return
+		}
+
+		prefix := "device"
+		s.regMu.RLock()
+		_, isDevice := s.registry[uuid]
+		if !isDevice {
+			if _, isEntity := s.entityToDevice[uuid]; isEntity {
+				prefix = "entity"
+			}
+		}
+		s.regMu.RUnlock()
+
+		subject := fmt.Sprintf("bundle.%s.update_%s_local_name", bundleID, prefix)
+		payload, _ := json.Marshal(map[string]any{"uuid": uuid, "name": name})
+		s.nc.Publish(subject, payload)
+		writeJSON(map[string]any{"ok": true, "subject": subject})
+		return
+	case "update_source_name":
+		uuid, _ := req.Args["uuid"].(string)
+		name, _ := req.Args["name"].(string)
+		if uuid == "" || name == "" {
+			http.Error(w, "uuid and name are required", http.StatusBadRequest)
+			return
+		}
+		bundleID := resolveBundle(uuid)
+		if bundleID == "" {
+			http.Error(w, "unable to resolve bundle for object", http.StatusNotFound)
+			return
+		}
+
+		prefix := "device"
+		s.regMu.RLock()
+		_, isDevice := s.registry[uuid]
+		if !isDevice {
+			if _, isEntity := s.entityToDevice[uuid]; isEntity {
+				prefix = "entity"
+			}
+		}
+		s.regMu.RUnlock()
+
+		subject := fmt.Sprintf("bundle.%s.update_%s_source_name", bundleID, prefix)
+		payload, _ := json.Marshal(map[string]any{"uuid": uuid, "name": name})
+		s.nc.Publish(subject, payload)
+		writeJSON(map[string]any{"ok": true, "subject": subject})
 		return
 	case "send_command":
 		uuid, _ := req.Args["uuid"].(string)
@@ -546,16 +934,42 @@ func (s *Server) handleMCPCall(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "uuid and command are required", http.StatusBadRequest)
 			return
 		}
-		subject := fmt.Sprintf("device.%s.command", uuid)
+
+		// Determine if it's a device or entity to set the correct subject prefix
+		prefix := "device"
+		s.regMu.RLock()
+		_, isDevice := s.registry[uuid]
+		if !isDevice {
+			if _, isEntity := s.entityToDevice[uuid]; isEntity {
+				prefix = "entity"
+			}
+		}
+		s.regMu.RUnlock()
+
+		subject := fmt.Sprintf("%s.%s.command", prefix, uuid)
+		payload := make(map[string]interface{})
+		for k, v := range req.Args {
+			if k == "payload" {
+				if nested, ok := v.(map[string]interface{}); ok {
+					for nk, nv := range nested {
+						payload[nk] = nv
+					}
+					continue
+				}
+			}
+			payload[k] = v
+		}
+
 		data, _ := json.Marshal(sdk.Message{
+			Source:  "core",
 			Subject: subject,
-			Payload: map[string]interface{}{"command": cmd},
+			Payload: payload,
 		})
 		if err := s.nc.Publish(subject, data); err != nil {
 			http.Error(w, "publish failed", http.StatusInternalServerError)
 			return
 		}
-		writeJSON(map[string]any{"ok": true})
+		writeJSON(map[string]any{"ok": true, "subject": subject})
 		return
 	case "delete_device":
 		uuid, _ := req.Args["uuid"].(string)
@@ -783,6 +1197,27 @@ func (s *Server) handleMCPCall(w http.ResponseWriter, r *http.Request) {
 
 		writeJSON(map[string]any{"ok": true})
 		return
+	case "reload_bundle":
+		bundleID, _ := req.Args["bundle_id"].(string)
+		if bundleID == "" {
+			http.Error(w, "bundle_id is required", http.StatusBadRequest)
+			return
+		}
+		respMsg, err := s.nc.Request(fmt.Sprintf("bundle.%s.reload", bundleID), nil, 3*time.Second)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("reload request failed: %v", err), http.StatusInternalServerError)
+			return
+		}
+		var reloadResp struct {
+			OK    bool   `json:"ok"`
+			Error string `json:"error"`
+		}
+		if err := json.Unmarshal(respMsg.Data, &reloadResp); err == nil && !reloadResp.OK {
+			http.Error(w, fmt.Sprintf("reload failed: %s", reloadResp.Error), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(map[string]any{"ok": true, "bundle_id": bundleID})
+		return
 	case "publish":
 		topic, _ := req.Args["topic"].(string)
 		rawData, hasData := req.Args["data"]
@@ -800,6 +1235,104 @@ func (s *Server) handleMCPCall(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(map[string]any{"ok": true})
+		return
+
+	case "add_label":
+		uuid, _ := req.Args["uuid"].(string)
+		label, _ := req.Args["label"].(string)
+		bundleID := resolveBundle(uuid)
+		payload, _ := json.Marshal(map[string]any{"uuid": uuid, "label": label})
+		s.nc.Publish(fmt.Sprintf("bundle.%s.add_label", bundleID), payload)
+		writeJSON(map[string]any{"ok": true})
+		return
+
+	case "remove_label":
+		uuid, _ := req.Args["uuid"].(string)
+		label, _ := req.Args["label"].(string)
+		bundleID := resolveBundle(uuid)
+		payload, _ := json.Marshal(map[string]any{"uuid": uuid, "label": label})
+		s.nc.Publish(fmt.Sprintf("bundle.%s.remove_label", bundleID), payload)
+		writeJSON(map[string]any{"ok": true})
+		return
+
+	case "set_labels":
+		uuid, _ := req.Args["uuid"].(string)
+		labels, _ := req.Args["labels"].([]interface{})
+		bundleID := resolveBundle(uuid)
+		payload, _ := json.Marshal(map[string]any{"uuid": uuid, "labels": labels})
+		s.nc.Publish(fmt.Sprintf("bundle.%s.set_labels", bundleID), payload)
+		writeJSON(map[string]any{"ok": true})
+		return
+
+	case "search_by_label":
+		var searchLabels []string
+		rawLabel, ok := req.Args["label"]
+		if !ok {
+			http.Error(w, "label is required", http.StatusBadRequest)
+			return
+		}
+
+		switch v := rawLabel.(type) {
+		case string:
+			searchLabels = []string{v}
+		case []interface{}:
+			for _, item := range v {
+				if s, ok := item.(string); ok {
+					searchLabels = append(searchLabels, s)
+				}
+			}
+		}
+
+		if len(searchLabels) == 0 {
+			writeJSON(map[string]any{})
+			return
+		}
+
+		registry := s.fetchAllDevices()
+		results := make(map[string]any)
+
+		matchesAll := func(target []string) bool {
+			for _, s := range searchLabels {
+				found := false
+				for _, t := range target {
+					if t == s {
+						found = true
+						break
+					}
+				}
+				if !found {
+					return false
+				}
+			}
+			return true
+		}
+
+		for uuid, raw := range registry {
+			var dev struct {
+				Metadata struct {
+					Name   string   `json:"name"`
+					Labels []string `json:"labels"`
+				} `json:"metadata"`
+				Entities map[string]struct {
+					Metadata struct {
+						Name   string   `json:"name"`
+						Labels []string `json:"labels"`
+					} `json:"metadata"`
+				} `json:"entities"`
+			}
+			if err := json.Unmarshal(raw, &dev); err == nil {
+				if matchesAll(dev.Metadata.Labels) {
+					results[uuid] = dev
+				}
+
+				for eid, ent := range dev.Entities {
+					if matchesAll(ent.Metadata.Labels) {
+						results[eid] = ent
+					}
+				}
+			}
+		}
+		writeJSON(results)
 		return
 	default:
 		http.Error(w, "unknown tool", http.StatusBadRequest)
